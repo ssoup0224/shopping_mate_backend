@@ -12,7 +12,11 @@ import org.springframework.web.util.UriComponentsBuilder;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -30,15 +34,21 @@ public class NaverProductService {
     public List<NaverProductDto> naverShopSearchAPI(NaverRequestVariableDto naverVariable) {
         // 참고 url: https://ssong915.tistory.com/36
 
+        // 가격순 정렬인 경우, 정확도를 위해 유사도순으로 많이(100개) 가져와서 백엔드에서 필터링 후 정렬한다.
+        String searchSort = naverVariable.getSort();
+        int searchDisplay = naverVariable.getDisplay() != null ? naverVariable.getDisplay() : 10;
+        boolean isPriceSort = "asc".equals(searchSort) || "dsc".equals(searchSort);
+
         URI uri = UriComponentsBuilder.fromUriString(naverUrl)
                 .path("v1/search/shop.json")
                 .queryParam("query", naverVariable.getQuery())
-                .queryParam("display", naverVariable.getDisplay())
+                .queryParam("display", isPriceSort ? 100 : searchDisplay)
                 .queryParam("start", naverVariable.getStart())
-                .queryParam("sort", naverVariable.getSort())
+                .queryParam("sort", isPriceSort ? "sim" : searchSort)
                 .encode()
                 .build()
                 .toUri();
+
         log.info("uri : {}", uri);
         RestTemplate restTemplate = new RestTemplate();
 
@@ -51,9 +61,73 @@ public class NaverProductService {
         ResponseEntity<String> result = restTemplate.exchange(req, String.class);
         List<NaverProductDto> naverProductDtos = fromJSONtoNaverProduct(result.getBody());
 
-        log.info("result ={}", naverProductDtos);
-        return naverProductDtos;
+        // 백엔드 필터링: 검색어의 모든 토큰이 제목에 포함되어야 함 (HTML 태그 제거 후 비교)
+        List<String> queryTokens = Arrays.stream(naverVariable.getQuery().toLowerCase().split(" "))
+                .filter(t -> !t.isEmpty())
+                .toList();
 
+        List<NaverProductDto> filteredList = naverProductDtos.stream()
+                .filter(item -> {
+                    String cleanTitle = item.getTitle().replaceAll("<[^>]*>", "").toLowerCase();
+                    return queryTokens.stream().allMatch(token -> matchesWithUnits(cleanTitle, token));
+                })
+                .collect(Collectors.toList());
+
+        // 가격순 정렬인 경우 백엔드에서 다시 정렬
+        if (isPriceSort) {
+            Comparator<NaverProductDto> priceComparator = Comparator.comparingInt(NaverProductDto::getLprice);
+            if ("dsc".equals(searchSort)) {
+                priceComparator = priceComparator.reversed();
+            }
+            filteredList.sort(priceComparator);
+        }
+
+        // 요청한 개수만큼 반환
+        List<NaverProductDto> finalResults = filteredList.stream()
+                .limit(searchDisplay)
+                .collect(Collectors.toList());
+
+        log.info("result count: {}, filtered count: {}", naverProductDtos.size(), finalResults.size());
+        return finalResults;
+    }
+
+    private boolean matchesWithUnits(String title, String token) {
+        if (title.contains(token))
+            return true;
+
+        // 단위 변환 시도 (L <-> ml, kg <-> g)
+        String normalizedToken = normalizeMeasurement(token);
+        if (normalizedToken == null)
+            return false;
+
+        // 제목 내의 모든 단어들에 대해 단위 변환 후 비교
+        return Arrays.stream(title.split("\\s+"))
+                .map(this::normalizeMeasurement)
+                .filter(Objects::nonNull)
+                .anyMatch(normalizedToken::equals);
+    }
+
+    private String normalizeMeasurement(String token) {
+        // 숫자 + 단위 (L, ml, kg, g) 추출 regex
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("^(\\d+\\.?\\d*)(l|ml|kg|g)$");
+        java.util.regex.Matcher matcher = pattern.matcher(token.toLowerCase());
+
+        if (matcher.find()) {
+            double value = Double.parseDouble(matcher.group(1));
+            String unit = matcher.group(2);
+
+            switch (unit) {
+                case "l":
+                    return (int) (value * 1000) + "ml";
+                case "ml":
+                    return (int) value + "ml";
+                case "kg":
+                    return (int) (value * 1000) + "g";
+                case "g":
+                    return (int) value + "g";
+            }
+        }
+        return null;
     }
 
     private List<NaverProductDto> fromJSONtoNaverProduct(String result) {
@@ -70,5 +144,4 @@ public class NaverProductService {
         }
         return naverProductDtoList;
     }
-
 }
