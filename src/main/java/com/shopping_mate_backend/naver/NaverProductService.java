@@ -15,7 +15,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Objects;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -67,10 +67,7 @@ public class NaverProductService {
                 .toList();
 
         List<NaverProductDto> filteredList = naverProductDtos.stream()
-                .filter(item -> {
-                    String cleanTitle = item.getTitle().replaceAll("<[^>]*>", "").toLowerCase();
-                    return queryTokens.stream().allMatch(token -> matchesWithUnits(cleanTitle, token));
-                })
+                .filter(item -> isHighlyRelevant(item.getTitle(), queryTokens))
                 .collect(Collectors.toList());
 
         // 가격순 정렬인 경우 백엔드에서 다시 정렬
@@ -91,40 +88,91 @@ public class NaverProductService {
         return finalResults;
     }
 
+    private boolean isHighlyRelevant(String title, List<String> queryTokens) {
+        String cleanTitle = title.replaceAll("<[^>]*>", "").toLowerCase();
+
+        // 1. 필수 토큰(용량/무게 등 수치) 필터링 - 반드시 포함되어야 함
+        List<String> measurementTokens = queryTokens.stream()
+                .filter(t -> normalizeMeasurement(t) != null)
+                .toList();
+
+        for (String mToken : measurementTokens) {
+            if (!matchesWithUnits(cleanTitle, mToken)) {
+                return false;
+            }
+        }
+
+        // 2. 일반 토큰 필터링 - 유연하게 매칭 (시노님 처리 및 75% 이상 매치)
+        List<String> normalTokens = queryTokens.stream()
+                .filter(t -> normalizeMeasurement(t) == null)
+                .toList();
+
+        if (normalTokens.isEmpty())
+            return true;
+
+        long matchCount = normalTokens.stream()
+                .filter(token -> containsWithSynonyms(cleanTitle, token))
+                .count();
+
+        return (double) matchCount / normalTokens.size() >= 0.75;
+    }
+
+    private boolean containsWithSynonyms(String title, String token) {
+        if (title.contains(token))
+            return true;
+
+        Map<String, List<String>> synonyms = Map.of(
+                "피존", List.of("피죤"),
+                "피죤", List.of("피존"),
+                "리필", List.of("리필용"),
+                "용기", List.of("본품"));
+
+        return synonyms.getOrDefault(token, List.of()).stream()
+                .anyMatch(title::contains);
+    }
+
     private boolean matchesWithUnits(String title, String token) {
         if (title.contains(token))
             return true;
 
-        // 단위 변환 시도 (L <-> ml, kg <-> g)
         String normalizedToken = normalizeMeasurement(token);
         if (normalizedToken == null)
             return false;
 
-        // 제목 내의 모든 단어들에 대해 단위 변환 후 비교
-        return Arrays.stream(title.split("\\s+"))
-                .map(this::normalizeMeasurement)
-                .filter(Objects::nonNull)
-                .anyMatch(normalizedToken::equals);
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("(\\d+\\.?\\d*)\\s*(l|ml|kg|g)");
+        java.util.regex.Matcher matcher = pattern.matcher(title);
+
+        while (matcher.find()) {
+            String titleMeasurement = matcher.group(1) + matcher.group(2);
+            if (normalizedToken.equals(normalizeMeasurement(titleMeasurement))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String normalizeMeasurement(String token) {
-        // 숫자 + 단위 (L, ml, kg, g) 추출 regex
+        // 숫자 + 단위 추출 regex
         java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("^(\\d+\\.?\\d*)(l|ml|kg|g)$");
         java.util.regex.Matcher matcher = pattern.matcher(token.toLowerCase());
 
         if (matcher.find()) {
-            double value = Double.parseDouble(matcher.group(1));
-            String unit = matcher.group(2);
+            try {
+                double value = Double.parseDouble(matcher.group(1));
+                String unit = matcher.group(2);
 
-            switch (unit) {
-                case "l":
-                    return (int) (value * 1000) + "ml";
-                case "ml":
-                    return (int) value + "ml";
-                case "kg":
-                    return (int) (value * 1000) + "g";
-                case "g":
-                    return (int) value + "g";
+                switch (unit) {
+                    case "l":
+                        return (int) (value * 1000) + "ml";
+                    case "ml":
+                        return (int) value + "ml";
+                    case "kg":
+                        return (int) (value * 1000) + "g";
+                    case "g":
+                        return (int) value + "g";
+                }
+            } catch (NumberFormatException e) {
+                return null;
             }
         }
         return null;
